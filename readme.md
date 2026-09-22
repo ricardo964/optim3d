@@ -1,4 +1,4 @@
-# 3D Point Cloud from CARLA Depth Maps
+# 3D Point Cloud
 
 Proyecto educativo para generar y procesar nubes de puntos 3D a partir de imágenes de profundidad sintéticas producidas por el simulador [CARLA](https://carla.org/). El objetivo es optimizar el pipeline de reconstrucción 3D para que pueda ejecutarse en computadoras de bajo rendimiento.
 
