@@ -1,4 +1,5 @@
 import numpy as np
+import open3d as o3d
 
 def carla_depth_map_to_3d_points(image, fov) -> np.array:
     B = image[:, :, 0].astype(np.float64)
@@ -25,10 +26,22 @@ def carla_depth_map_to_3d_points(image, fov) -> np.array:
     points_3d = np.stack([X, Y, Z], axis=-1)
     return points_3d
 
+def depth_map_to_3d_points(image, fov) -> np.array:
+    pass
 
 def points_map_to_cloud(points_map: np.ndarray, max_depth: float = None) -> np.ndarray:
     cloud = points_map.reshape(-1, 3)
     if max_depth is not None:
         cloud = cloud[cloud[:, 2] < max_depth]
     return cloud
+
+def voxel_cloud(point_cloud, voxel_size):
+    filter_pcb = point_cloud.voxel_down_sample(voxel_size)
+    filter_pcb, ind = filter_pcb.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
+
+    filter_pcb.estimate_normals(
+        search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 2, max_nn=30)
+    )
+
+    return filter_pcb
 

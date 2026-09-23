@@ -11,13 +11,19 @@ def main(args: dict[str, any]) -> None:
         path = os.path.join(directory, image_path)
         image = cv2.imread(path)
 
-        position_image = carla_depth_map_to_3d_points(image, 80)
+        position_image = carla_depth_map_to_3d_points(image, fov=90)
         points = points_map_to_cloud(position_image)
+
 
         point_cloud = o3d.geometry.PointCloud()
         point_cloud.points = o3d.utility.Vector3dVector(points)
 
-        o3d.io.write_point_cloud("frame.ply", point_cloud)
+        _point_cloud = voxel_cloud(point_cloud, 0.5)
+
+        # print(point_cloud)
+        # print(_point_cloud)
+
+        # o3d.io.write_point_cloud("frame.ply", point_cloud)
 
         break # test only
 
