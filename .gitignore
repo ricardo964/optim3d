@@ -1,2 +1,23 @@
-__pycache__
-output
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# Salidas de main.py (--out) y nubes/mallas exportadas
+clouds/
+*.ply
+*.pcd
+*.obj
+
+# Ultralytics: runs/ y pesos que descarga automáticamente (el de profundidad sí se versiona)
+runs/
+*.pt
+!yolo26n-depth.pt
+
+# Editores y sistema
+.vscode/
+.idea/
+*.swp
+.DS_Store

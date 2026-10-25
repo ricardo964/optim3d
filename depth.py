@@ -10,12 +10,11 @@ depth_estimation_model = YOLO("yolo26n-depth.pt")
 
 
 # yolo26n-depth
-def estimate_depth(rgb_image: np.ndarray, size: tuple[int, int] = None) -> np.ndarray:
-    """Profundidad del frame; si se da size=(w, h) se redimensiona en GPU a ese tamaño."""
-    h, w = rgb_image.shape[:2]
+def estimate_depth(bgr_image: np.ndarray, size: tuple[int, int] = None) -> np.ndarray:
+    """Profundidad del frame BGR; si se da size=(w, h) se redimensiona en GPU a ese tamaño."""
+    h, w = bgr_image.shape[:2]
     out_w, out_h = size if size is not None else (w, h)
 
-    bgr_image = np.ascontiguousarray(rgb_image[..., ::-1])
     result = depth_estimation_model(bgr_image, device=DEVICE, verbose=False)[0]
 
     depth = result.depth.data.float().squeeze()

@@ -1,117 +1,186 @@
-from functools import lru_cache
-
+import cv2
 import numpy as np
 import open3d as o3d
+import open3d.core as o3c
 
 reg = o3d.pipelines.registration
 
+sift = cv2.SIFT_create(nfeatures=2000)
+matcher = cv2.FlannBasedMatcher(dict(algorithm=1, trees=5), dict(checks=50))
 
-@lru_cache(maxsize=4)
-def _ray_grid(h: int, w: int, fov: float) -> tuple[np.ndarray, np.ndarray]:
-    """Rayos (u - cx) / f y (v - cy) / f para una resolución dada, cacheados."""
+
+def intrinsics(w: int, h: int, fov: float) -> np.ndarray:
+    """Matriz K pinhole para un FOV horizontal en grados, con el centro óptico en el centro."""
     f = (w / 2) / np.tan(np.radians(fov) / 2)
-    cx, cy = (w - 1) / 2, (h - 1) / 2
-    u, v = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
-    return (u - cx) / f, (v - cy) / f
+    return np.array([[f, 0, (w - 1) / 2], [0, f, (h - 1) / 2], [0, 0, 1]])
 
 
-def depth_map_to_3d_points(depth: np.ndarray, fov: float) -> np.ndarray:
-    h, w = depth.shape[:2]
-    rx, ry = _ray_grid(h, w, fov)
-    z = depth.astype(np.float32)
-    return np.stack((rx * z, ry * z, z), axis=-1)
+def valid_depth_mask(depth, max_depth=None, percentile=None, edge_threshold=0.03) -> np.ndarray:
+    """Descarta profundidades inválidas, el fondo lejano y "flying pixels" en discontinuidades.
 
-
-def valid_depth_mask(depth: np.ndarray, max_depth: float = None, edge_threshold: float = 0.05) -> np.ndarray:
-    """Descarta profundidades inválidas y "flying pixels" en discontinuidades.
-
-    Un píxel se considera borde si su gradiente relativo |∇z| / z supera edge_threshold.
+    percentile recorta el fondo de cada frame (cielo, ventanas), donde la profundidad
+    monocular es menos fiable. Un píxel es borde si su gradiente relativo |∇z| / z supera
+    edge_threshold.
     """
     z = depth.astype(np.float32)
     valid = np.isfinite(z) & (z > 0)
     if max_depth is not None:
         valid &= z < max_depth
-    if edge_threshold is not None and edge_threshold > 0:
+    if percentile is not None and percentile < 100 and valid.any():
+        valid &= z <= np.percentile(z[valid], percentile)
+    if edge_threshold:
         gy, gx = np.gradient(z)
         valid &= np.hypot(gx, gy) < edge_threshold * np.maximum(z, 1e-6)
     return valid
 
 
-def make_point_cloud(points: np.ndarray, colors: np.ndarray) -> o3d.geometry.PointCloud:
-    point_cloud = o3d.geometry.PointCloud()
-    point_cloud.points = o3d.utility.Vector3dVector(points.astype(np.float64))
-    point_cloud.colors = o3d.utility.Vector3dVector(colors.astype(np.float64))
-    return point_cloud
+def detect_features(gray: np.ndarray, depth: np.ndarray, K: np.ndarray):
+    """Keypoints SIFT (xy), descriptores y su posición 3D en cámara (NaN sin profundidad válida).
 
-
-def voxel_cloud(point_cloud, voxel_size):
-    filter_pcb = point_cloud.voxel_down_sample(voxel_size)
-    filter_pcb, _ = filter_pcb.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
-    return filter_pcb
-
-
-def icp_cloud(point_cloud, voxel_size, max_points=10000):
-    """Versión gruesa de la nube con normales, para registrar más rápido.
-
-    En escenas lejanas el voxel no reduce lo suficiente, así que se limita a max_points.
+    gray puede tener más resolución que depth: SIFT encuentra muchos más keypoints en el
+    frame original, y sus coordenadas se llevan a la resolución de trabajo de depth y K.
     """
-    coarse = point_cloud.voxel_down_sample(voxel_size)
-    if max_points and len(coarse.points) > max_points:
-        coarse = coarse.uniform_down_sample(int(np.ceil(len(coarse.points) / max_points)))
-    coarse.estimate_normals(
-        search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 2, max_nn=30)
-    )
-    # nube en coordenadas de cámara: la cámara está en el origen
-    coarse.orient_normals_towards_camera_location(np.zeros(3))
-    return coarse
+    keypoints, desc = sift.detectAndCompute(gray, None)
+    if desc is None:
+        return np.empty((0, 2), np.float32), np.empty((0, 128), np.float32), np.empty((0, 3))
+    h, w = depth.shape
+    # cambio de resolución por eje respetando el centro de píxel: x' = (x + 0.5) * s - 0.5
+    factor = np.float32([w / gray.shape[1], h / gray.shape[0]])
+    xy = (np.float32([k.pt for k in keypoints]) + 0.5) * factor - 0.5
+    u = np.clip(np.round(xy[:, 0]).astype(int), 0, w - 1)
+    v = np.clip(np.round(xy[:, 1]).astype(int), 0, h - 1)
+    z = depth[v, u].astype(np.float64)
+    xyz = np.column_stack(((xy[:, 0] - K[0, 2]) / K[0, 0] * z, (xy[:, 1] - K[1, 2]) / K[1, 1] * z, z))
+    xyz[z <= 0] = np.nan
+    return xy, desc, xyz
 
 
-def _icp(source, target, max_distance, init, max_iteration):
-    return reg.registration_icp(
-        source,
-        target,
-        max_distance,
-        init,
-        reg.TransformationEstimationPointToPlane(),
-        reg.ICPConvergenceCriteria(max_iteration=max_iteration),
-    )
+def match_features(desc_a, desc_b, ratio=0.75) -> np.ndarray:
+    """Pares (i_a, i_b) que pasan el ratio test de Lowe."""
+    if len(desc_a) < 2 or len(desc_b) < 2:
+        return np.empty((0, 2), int)
+    pairs = []
+    for knn in matcher.knnMatch(desc_a, desc_b, k=2):
+        if len(knn) == 2 and knn[0].distance < ratio * knn[1].distance:
+            pairs.append((knn[0].queryIdx, knn[0].trainIdx))
+    return np.array(pairs, int).reshape(-1, 2)
 
 
-def scale_from_correspondences(source, target, result, scale_range=(0.9, 1.1)):
-    """Razón mediana de distancias a la cámara de target entre puntos correspondientes.
+def estimate_pose(src, dst, K, min_inliers, reprojection_error=6.0):
+    """PnP + RANSAC entre los puntos 3D de src y los keypoints 2D de dst.
 
-    No se usa Sim3 punto-a-punto porque encoger la nube aumenta las correspondencias
-    y la escala colapsa; la mediana de las razones no tiene ese sesgo.
+    src y dst son (xy, desc, xyz). Devuelve (T 4x4 que lleva puntos de la cámara src a la
+    cámara dst, pares inliers) o None si no hay suficientes inliers.
     """
-    corr = np.asarray(result.correspondence_set)
-    if len(corr) < 100:
+    pairs = match_features(src[1], dst[1])
+    pairs = pairs[np.isfinite(src[2][pairs[:, 0], 2])]
+    if len(pairs) < min_inliers:
+        return None
+    obj = src[2][pairs[:, 0]]
+    img = dst[0][pairs[:, 1]].astype(np.float64)
+    found, rvec, tvec, inliers = cv2.solvePnPRansac(
+        obj, img, K, None, iterationsCount=500, reprojectionError=reprojection_error, confidence=0.999
+    )
+    if not found or inliers is None or len(inliers) < min_inliers:
+        return None
+    inliers = inliers.ravel()
+    rvec, tvec = cv2.solvePnPRefineLM(obj[inliers], img[inliers], K, None, rvec, tvec)
+    T = np.eye(4)
+    T[:3, :3] = cv2.Rodrigues(rvec)[0]
+    T[:3, 3] = tvec.ravel()
+    return T, pairs[inliers]
+
+
+def depth_scale(T, src_xyz, dst_xyz, pairs, scale_range=(0.5, 2.0)) -> float:
+    """Escala de la profundidad de dst respecto a src: z que predice la pose / z de la red."""
+    z_pred = (src_xyz[pairs[:, 0]] @ T[:3, :3].T + T[:3, 3])[:, 2]
+    z = dst_xyz[pairs[:, 1], 2]
+    ok = np.isfinite(z) & (z_pred > 0)
+    if ok.sum() < 20:
         return 1.0
-    T = result.transformation
-    src = np.asarray(source.points)[corr[:, 0]] @ T[:3, :3].T + T[:3, 3]
-    dst = np.asarray(target.points)[corr[:, 1]]
-    ratio = np.linalg.norm(dst, axis=1) / np.maximum(np.linalg.norm(src, axis=1), 1e-6)
-    return float(np.clip(np.median(ratio), *scale_range))
+    return float(np.clip(np.median(z_pred[ok] / z[ok]), *scale_range))
 
 
-def register_icp(source, target, max_distance, init=None, align_scale=False):
-    """Alinea source sobre target con ICP punto-a-plano (target necesita normales).
+def information_matrix(points: np.ndarray) -> np.ndarray:
+    """Matriz de información 6x6 de un registro, como get_information_matrix_from_point_clouds
+    de Open3D pero a partir de los inliers (en coordenadas de la cámara destino)."""
+    x, y, z = points.T
+    G = np.zeros((len(points), 3, 6))
+    G[:, 0, 1], G[:, 0, 2], G[:, 0, 3] = z, -y, 1
+    G[:, 1, 0], G[:, 1, 2], G[:, 1, 4] = -z, x, 1
+    G[:, 2, 0], G[:, 2, 1], G[:, 2, 5] = y, -x, 1
+    return np.einsum("nki,nkj->ij", G, G)
 
-    Con align_scale, además estima la escala de source respecto a target, escala source
-    en sitio (respecto a su cámara) y refina. Devuelve (transformación 4x4 que lleva
-    source al sistema de target, fitness, rmse, escala aplicada).
+
+def optimize_pose_graph(graph, max_distance):
+    """Optimización global con line process: descarta los loop closures inconsistentes."""
+    option = reg.GlobalOptimizationOption(
+        max_correspondence_distance=max_distance,
+        edge_prune_threshold=0.25,
+        preference_loop_closure=0.1,
+        reference_node=0,
+    )
+    with o3d.utility.VerbosityContextManager(o3d.utility.VerbosityLevel.Error):
+        reg.global_optimization(
+            graph,
+            reg.GlobalOptimizationLevenbergMarquardt(),
+            reg.GlobalOptimizationConvergenceCriteria(),
+            option,
+        )
+
+
+def integrate_tsdf(frames, poses, K, voxel_size, sdf_trunc):
+    """Fusiona frames (rgb uint8, profundidad en metros) con sus poses cámara -> mundo.
+
+    Se usa VoxelBlockGrid en CPU: en Open3D 0.20 ScalableTSDFVolume devuelve volúmenes
+    vacíos y VoxelBlockGrid en CUDA se bloquea junto a torch.
     """
-    if init is None:
-        init = np.eye(4)
-    if not align_scale:
-        result = _icp(source, target, max_distance, init, 50)
-        return result.transformation, result.fitness, result.inlier_rmse, 1.0
+    volume = o3d.t.geometry.VoxelBlockGrid(
+        attr_names=("tsdf", "weight", "color"),
+        attr_dtypes=(o3c.float32, o3c.float32, o3c.float32),
+        attr_channels=(1, 1, 3),
+        voxel_size=voxel_size,
+        block_resolution=8,
+        block_count=1000,  # el hashmap crece según haga falta
+    )
+    intrinsic = o3c.Tensor(K, o3c.float64)
+    trunc = sdf_trunc / voxel_size
+    depth_max = 1e6  # el fondo ya se recortó en valid_depth_mask
+    for (rgb, depth), pose in zip(frames, poses):
+        if not (depth > 0).any():
+            continue  # Open3D aborta la integración si el frame no toca ningún bloque
+        depth = o3d.t.geometry.Image(o3c.Tensor(depth.astype(np.float32)))
+        color = o3d.t.geometry.Image(o3c.Tensor(rgb.astype(np.float32) / 255))
+        extrinsic = o3c.Tensor(np.linalg.inv(pose), o3c.float64)
+        blocks = volume.compute_unique_block_coordinates(
+            depth, intrinsic, extrinsic, 1.0, depth_max, trunc_voxel_multiplier=trunc
+        )
+        volume.integrate(
+            blocks, depth, color, intrinsic, intrinsic, extrinsic, 1.0, depth_max, trunc_voxel_multiplier=trunc
+        )
+    return volume
 
-    result = _icp(source, target, max_distance, init, 30)
-    scale = scale_from_correspondences(source, target, result)
-    # s(Rp + t) = R(sp) + st: escalar respecto a la cámara de target equivale a escalar
-    # source respecto a su propia cámara y escalar la traslación
-    source.scale(scale, center=np.zeros(3))
-    init = result.transformation.copy()
-    init[:3, 3] *= scale
-    result = _icp(source, target, max_distance, init, 20)
-    return result.transformation, result.fitness, result.inlier_rmse, scale
+
+def extract_surface(volume, min_weight):
+    """Nube y malla de la superficie del TSDF; el color interpolado puede salir de [0, 1]."""
+    cloud = volume.extract_point_cloud(weight_threshold=min_weight)
+    mesh = volume.extract_triangle_mesh(weight_threshold=min_weight)
+    cloud.point.colors = cloud.point.colors.clip(0, 1)
+    mesh.vertex.colors = mesh.vertex.colors.clip(0, 1)
+    return cloud.to_legacy(), mesh.to_legacy()
+
+
+def clean_mesh(mesh, min_component=0.01, smooth_iterations=10):
+    """Quita las islas con menos de min_component de los triángulos y suaviza con Taubin,
+    que a diferencia del laplaciano no encoge la malla."""
+    if min_component > 0 and mesh.has_triangles():
+        clusters, counts, _ = mesh.cluster_connected_triangles()
+        clusters, counts = np.asarray(clusters), np.asarray(counts)
+        mesh.remove_triangles_by_mask(counts[clusters] < min_component * len(mesh.triangles))
+        mesh.remove_unreferenced_vertices()
+    if smooth_iterations > 0:
+        mesh = mesh.filter_smooth_taubin(number_of_iterations=smooth_iterations)
+        # Taubin también suaviza el color y puede sacarlo de [0, 1]
+        mesh.vertex_colors = o3d.utility.Vector3dVector(np.clip(np.asarray(mesh.vertex_colors), 0, 1))
+    mesh.compute_vertex_normals()
+    return mesh
